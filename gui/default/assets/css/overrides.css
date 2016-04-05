@@ -26,7 +26,6 @@ ul+h5 {
 }
 
 .panel-progress {
-    background: #3498db;
     height: 3px;
     left: 0;
     position: absolute;
@@ -38,6 +37,9 @@ ul+h5 {
     position: relative;
     text-overflow: ellipsis;
     overflow: hidden;
+}
+.panel-title a:hover {
+    text-decoration: none;
 }
 
 identicon {
@@ -54,10 +56,6 @@ identicon {
     height: 1em;
 }
 
-.identicon rect {
-    fill: #333;
-}
-
 .checkbox {
     margin-top: 0px;
 }
@@ -69,6 +67,10 @@ identicon {
 .popover {
     max-width: none;
     min-width: 250px;
+}
+
+.tooltip {
+    word-wrap:break-word;
 }
 
 .panel-heading .fa, .modal-header .fa {
@@ -96,15 +98,13 @@ identicon {
 }
 
 .list-no-bullet {
-    list-style-type: none
+    list-style-type: none;
 }
 
 .li-column {
     display: inline-block;
     min-width: 7em;
     margin-right: 1em;
-    background-color: rgb(236, 240, 241);
-    border-radius: 3px;
     padding: 1px 4px;
     margin: 2px 2px;
 }
@@ -140,63 +140,36 @@ table.table-condensed td {
     text-overflow: ellipsis;
     white-space: nowrap;
 }
-@media (max-width:767px) {
-    table.table-condensed td {
-        /* for mobile phones to allow linebreaks in long repro folder/shared with
-        * columns. */
-        white-space: normal;
-    }
+
+table.table-condensed td.no-overflow-ellipse {
+    white-space: normal;
 }
 
+.folder-advanced {
+    padding: 1rem;
+    margin-bottom: 15px;
+}
+
+.folder-advanced-toggle {
+    cursor: pointer;
+}
+.folder-advanced-toggle .collapse,
+.folder-advanced-toggle.collapsed .expand {
+    display: inline-block;
+}
+
+.folder-advanced-toggle.collapsed .collapse,
+.folder-advanced-toggle .expand{
+    display: none;
+}
+
+.nav>li{
+    float: left;
+}
 .navbar-right {
     /* to align with panel */
     padding-right: 15px;
 }
-
-/**
- * Menu for select language
- */
-
-@media (min-width:480px) and (max-width:649px) {
-    *[language-select] > .dropdown-menu {
-        width: 230px;
-    }
-}
-
-@media (min-width:650px) {
-    *[language-select] > .dropdown-menu > li {
-        width: 50%;
-        float: left;
-    }
-    *[language-select] > .dropdown-menu {
-        width: 440px;
-    }
-}
-
-
-@media (max-width:479px) {
-    .dropdown-menu {
-        padding-top: 55px;
-    }
-
-    nav .dropdown-toggle {
-        font-size: 14px;
-    }
-
-    .dropdown-toggle {
-        float: left;
-    }
-
-    .navbar-brand {
-        padding-left: 0;
-        padding-top: 16px;
-    }
-
-    .navbar-nav .open .dropdown-menu > li > a {
-        padding: 12px 15px 12px 25px;
-    }
-}
-
 
 .panel-body .table-condensed {
     margin-bottom: 0;
@@ -244,13 +217,88 @@ ul.three-columns li, ul.two-columns li {
 }
 
 /** Footer nav on small devices **/
-
 @media (max-width: 1199px) {
+    /* Stay at the end of the page, with space reserved for the footer
+    usually taking up two rows. */
+
+    html {
+        position: relative;
+        min-height: 100%;
+    }
+
     body {
-        padding-bottom: 0;
+        padding-bottom: 60px;
     }
 
     .navbar-fixed-bottom {
-        position: static;
+        position: absolute;
     }
+}
+
+@media (max-width: 768px) {
+    /* Layout after the normal contents, as this is when the footer switches
+    to a vertical layout. */
+
+    body {
+        padding-bottom: 0px;
+    }
+
+    .navbar-fixed-bottom {
+        position: relative;
+    }
+
+    .nav>li {
+        float:right;
+    }
+
+    table.table-condensed td {
+        /* for mobile phones to allow linebreaks in long repro folder/shared with
+        * columns. */
+        white-space: normal;
+    }
+}
+
+@media (min-width:650px) {
+    *[language-select] > .dropdown-menu > li {
+        width: 50%;
+        float: left;
+    }
+    *[language-select] > .dropdown-menu {
+        width: 440px;
+    }
+}
+
+/**
+ * Menu for select language
+ */
+@media (min-width:480px) and (max-width:649px) {
+    *[language-select] > .dropdown-menu {
+        width: 230px;
+    }
+}
+
+@media (max-width:479px) {
+    .dropdown-menu {
+        padding-top: 55px;
+    }
+
+    nav .dropdown-toggle {
+        font-size: 1em;
+    }
+
+    .dropdown-toggle {
+        float: left;
+    }
+
+    .logo{
+        margin:auto;
+    }
+
+    .navbar-nav .open .dropdown-menu > li > a {
+        padding: 12px 15px 12px 25px;
+    }
+
+    .navbar-fixed-bottom li{
+         width:100%;
+     }
 }

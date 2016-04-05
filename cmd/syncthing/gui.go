@@ -32,13 +32,14 @@ import (
 	"github.com/syncthing/syncthing/lib/discover"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/logger"
-	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay"
+	"github.com/syncthing/syncthing/lib/stats"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/tlsutil"
 	"github.com/syncthing/syncthing/lib/upgrade"
+	"github.com/syncthing/syncthing/lib/util"
 	"github.com/vitrun/qart/qr"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -50,13 +51,15 @@ var (
 
 type apiService struct {
 	id              protocol.DeviceID
-	cfg             *config.Wrapper
+	cfg             configIntf
+	httpsCertFile   string
+	httpsKeyFile    string
 	assetDir        string
 	themes          []string
-	model           *model.Model
-	eventSub        *events.BufferedSubscription
-	discoverer      *discover.CachingMux
-	relayService    *relay.Service
+	model           modelIntf
+	eventSub        events.BufferedSubscription
+	discoverer      discover.CachingMux
+	relayService    relay.Service
 	fss             *folderSummaryService
 	systemConfigMut sync.Mutex    // serializes posts to /rest/system/config
 	stop            chan struct{} // signals intentional stop
@@ -66,14 +69,57 @@ type apiService struct {
 	listener    net.Listener
 	listenerMut sync.Mutex
 
-	guiErrors *logger.Recorder
-	systemLog *logger.Recorder
+	guiErrors logger.Recorder
+	systemLog logger.Recorder
 }
 
-func newAPIService(id protocol.DeviceID, cfg *config.Wrapper, assetDir string, m *model.Model, eventSub *events.BufferedSubscription, discoverer *discover.CachingMux, relayService *relay.Service, errors, systemLog *logger.Recorder) (*apiService, error) {
+type modelIntf interface {
+	GlobalDirectoryTree(folder, prefix string, levels int, dirsonly bool) map[string]interface{}
+	Completion(device protocol.DeviceID, folder string) float64
+	Override(folder string)
+	NeedFolderFiles(folder string, page, perpage int) ([]db.FileInfoTruncated, []db.FileInfoTruncated, []db.FileInfoTruncated, int)
+	NeedSize(folder string) (nfiles int, bytes int64)
+	ConnectionStats() map[string]interface{}
+	DeviceStatistics() map[string]stats.DeviceStatistics
+	FolderStatistics() map[string]stats.FolderStatistics
+	CurrentFolderFile(folder string, file string) (protocol.FileInfo, bool)
+	CurrentGlobalFile(folder string, file string) (protocol.FileInfo, bool)
+	ResetFolder(folder string)
+	Availability(folder, file string) []protocol.DeviceID
+	GetIgnores(folder string) ([]string, []string, error)
+	SetIgnores(folder string, content []string) error
+	PauseDevice(device protocol.DeviceID)
+	ResumeDevice(device protocol.DeviceID)
+	DelayScan(folder string, next time.Duration)
+	ScanFolder(folder string) error
+	ScanFolders() map[string]error
+	ScanFolderSubs(folder string, subs []string) error
+	BringToFront(folder, file string)
+	ConnectedTo(deviceID protocol.DeviceID) bool
+	GlobalSize(folder string) (nfiles, deleted int, bytes int64)
+	LocalSize(folder string) (nfiles, deleted int, bytes int64)
+	CurrentLocalVersion(folder string) (int64, bool)
+	RemoteLocalVersion(folder string) (int64, bool)
+	State(folder string) (string, time.Time, error)
+}
+
+type configIntf interface {
+	GUI() config.GUIConfiguration
+	Raw() config.Configuration
+	Options() config.OptionsConfiguration
+	Replace(cfg config.Configuration) config.CommitResponse
+	Subscribe(c config.Committer)
+	Folders() map[string]config.FolderConfiguration
+	Devices() map[protocol.DeviceID]config.DeviceConfiguration
+	Save() error
+}
+
+func newAPIService(id protocol.DeviceID, cfg configIntf, httpsCertFile, httpsKeyFile, assetDir string, m modelIntf, eventSub events.BufferedSubscription, discoverer discover.CachingMux, relayService relay.Service, errors, systemLog logger.Recorder) (*apiService, error) {
 	service := &apiService{
 		id:              id,
 		cfg:             cfg,
+		httpsCertFile:   httpsCertFile,
+		httpsKeyFile:    httpsKeyFile,
 		assetDir:        assetDir,
 		model:           m,
 		eventSub:        eventSub,
@@ -88,11 +134,21 @@ func newAPIService(id protocol.DeviceID, cfg *config.Wrapper, assetDir string, m
 	}
 
 	seen := make(map[string]struct{})
+	// Load themes from compiled in assets.
 	for file := range auto.Assets() {
 		theme := strings.Split(file, "/")[0]
 		if _, ok := seen[theme]; !ok {
 			seen[theme] = struct{}{}
 			service.themes = append(service.themes, theme)
+		}
+	}
+	if assetDir != "" {
+		// Load any extra themes from the asset override dir.
+		for _, dir := range dirNames(assetDir) {
+			if _, ok := seen[dir]; !ok {
+				seen[dir] = struct{}{}
+				service.themes = append(service.themes, dir)
+			}
 		}
 	}
 
@@ -102,7 +158,7 @@ func newAPIService(id protocol.DeviceID, cfg *config.Wrapper, assetDir string, m
 }
 
 func (s *apiService) getListener(guiCfg config.GUIConfiguration) (net.Listener, error) {
-	cert, err := tls.LoadX509KeyPair(locations[locHTTPSCertFile], locations[locHTTPSKeyFile])
+	cert, err := tls.LoadX509KeyPair(s.httpsCertFile, s.httpsKeyFile)
 	if err != nil {
 		l.Infoln("Loading HTTPS certificate:", err)
 		l.Infoln("Creating new HTTPS certificate")
@@ -115,7 +171,7 @@ func (s *apiService) getListener(guiCfg config.GUIConfiguration) (net.Listener, 
 			name = tlsDefaultCommonName
 		}
 
-		cert, err = tlsutil.NewCertificate(locations[locHTTPSCertFile], locations[locHTTPSKeyFile], name, httpsRSABits)
+		cert, err = tlsutil.NewCertificate(s.httpsCertFile, s.httpsKeyFile, name, httpsRSABits)
 	}
 	if err != nil {
 		return nil, err
@@ -149,7 +205,16 @@ func (s *apiService) getListener(guiCfg config.GUIConfiguration) (net.Listener, 
 
 func sendJSON(w http.ResponseWriter, jsonObject interface{}) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
-	json.NewEncoder(w).Encode(jsonObject)
+	// Marshalling might fail, in which case we should return a 500 with the
+	// actual error.
+	bs, err := json.Marshal(jsonObject)
+	if err != nil {
+		// This Marshal() can't fail though.
+		bs, _ = json.Marshal(map[string]string{"error": err.Error()})
+		http.Error(w, string(bs), http.StatusInternalServerError)
+		return
+	}
+	w.Write(bs)
 }
 
 func (s *apiService) Serve() {
@@ -240,9 +305,6 @@ func (s *apiService) Serve() {
 	// protected, other requests will grant cookies.
 	handler := csrfMiddleware(s.id.String()[:5], "/rest", guiCfg, mux)
 
-	// Add the CORS handling
-	handler = corsMiddleware(handler)
-
 	// Add our version and ID as a header to responses
 	handler = withDetailsMiddleware(s.id, handler)
 
@@ -256,6 +318,9 @@ func (s *apiService) Serve() {
 		handler = redirectToHTTPSMiddleware(handler)
 	}
 
+	// Add the CORS handling
+	handler = corsMiddleware(handler)
+
 	handler = debugMiddleware(handler)
 
 	srv := http.Server{
@@ -267,8 +332,8 @@ func (s *apiService) Serve() {
 	defer s.fss.Stop()
 	s.fss.ServeBackground()
 
-	l.Infoln("API listening on", listener.Addr())
-	l.Infoln("GUI URL is", guiCfg.URL())
+	l.Infoln("GUI and API listening on", listener.Addr())
+	l.Infoln("Access the GUI via the following URL:", guiCfg.URL())
 	if s.started != nil {
 		// only set when run by the tests
 		close(s.started)
@@ -382,6 +447,10 @@ func corsMiddleware(next http.Handler) http.Handler {
 	// Handle CORS headers and CORS OPTIONS request.
 	// CORS OPTIONS request are typically sent by browser during AJAX preflight
 	// when the browser initiate a POST request.
+	//
+	// As the OPTIONS request is unauthorized, this handler must be the first
+	// of the chain (hence added at the end).
+	//
 	// See https://www.w3.org/TR/cors/ for details.
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Add a generous access-control-allow-origin header since we may be
@@ -527,7 +596,7 @@ func (s *apiService) getDBStatus(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, folderSummary(s.cfg, s.model, folder))
 }
 
-func folderSummary(cfg *config.Wrapper, m *model.Model, folder string) map[string]interface{} {
+func folderSummary(cfg configIntf, m modelIntf, folder string) map[string]interface{} {
 	var res = make(map[string]interface{})
 
 	res["invalid"] = cfg.Folders()[folder].Invalid
@@ -615,8 +684,14 @@ func (s *apiService) getDBFile(w http.ResponseWriter, r *http.Request) {
 	qs := r.URL.Query()
 	folder := qs.Get("folder")
 	file := qs.Get("file")
-	gf, _ := s.model.CurrentGlobalFile(folder, file)
-	lf, _ := s.model.CurrentFolderFile(folder, file)
+	gf, gfOk := s.model.CurrentGlobalFile(folder, file)
+	lf, lfOk := s.model.CurrentFolderFile(folder, file)
+
+	if !(gfOk || lfOk) {
+		// This file for sure does not exist.
+		http.Error(w, "No such object in the index", http.StatusNotFound)
+		return
+	}
 
 	av := s.model.Availability(folder, file)
 	sendJSON(w, map[string]interface{}{
@@ -659,7 +734,7 @@ func (s *apiService) postSystemConfig(w http.ResponseWriter, r *http.Request) {
 	if curAcc := s.cfg.Options().URAccepted; to.Options.URAccepted > curAcc {
 		// UR was enabled
 		to.Options.URAccepted = usageReportVersion
-		to.Options.URUniqueID = randomString(8)
+		to.Options.URUniqueID = util.RandomString(8)
 	} else if to.Options.URAccepted < curAcc {
 		// UR was disabled
 		to.Options.URAccepted = -1
@@ -859,7 +934,7 @@ func (s *apiService) getDBIgnores(w http.ResponseWriter, r *http.Request) {
 
 	sendJSON(w, map[string][]string{
 		"ignore":   ignores,
-		"patterns": patterns,
+		"expanded": patterns,
 	})
 }
 
@@ -1114,22 +1189,33 @@ func (s embeddedStatic) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		file = "index.html"
 	}
 
-	if s.assetDir != "" {
-		p := filepath.Join(s.assetDir, filepath.FromSlash(file))
-		_, err := os.Stat(p)
-		if err == nil {
-			http.ServeFile(w, r, p)
-			return
-		}
-	}
-
 	s.mut.RLock()
 	theme := s.theme
 	modified := s.lastModified
 	s.mut.RUnlock()
 
+	// Check for an override for the current theme.
+	if s.assetDir != "" {
+		p := filepath.Join(s.assetDir, s.theme, filepath.FromSlash(file))
+		if _, err := os.Stat(p); err == nil {
+			http.ServeFile(w, r, p)
+			return
+		}
+	}
+
+	// Check for a compiled in asset for the current theme.
 	bs, ok := s.assets[theme+"/"+file]
 	if !ok {
+		// Check for an overriden default asset.
+		if s.assetDir != "" {
+			p := filepath.Join(s.assetDir, config.DefaultTheme, filepath.FromSlash(file))
+			if _, err := os.Stat(p); err == nil {
+				http.ServeFile(w, r, p)
+				return
+			}
+		}
+
+		// Check for a compiled in default asset.
 		bs, ok = s.assets[config.DefaultTheme+"/"+file]
 		if !ok {
 			http.NotFound(w, r)
@@ -1255,4 +1341,27 @@ func (v jsonVersionVector) MarshalJSON() ([]byte, error) {
 		res[i] = fmt.Sprintf("%v:%d", c.ID, c.Value)
 	}
 	return json.Marshal(res)
+}
+
+func dirNames(dir string) []string {
+	fd, err := os.Open(dir)
+	if err != nil {
+		return nil
+	}
+	defer fd.Close()
+
+	fis, err := fd.Readdir(-1)
+	if err != nil {
+		return nil
+	}
+
+	var dirs []string
+	for _, fi := range fis {
+		if fi.IsDir() {
+			dirs = append(dirs, filepath.Base(fi.Name()))
+		}
+	}
+
+	sort.Strings(dirs)
+	return dirs
 }

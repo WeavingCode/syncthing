@@ -1,6 +1,6 @@
 // Copyright (C) 2014 The Protocol Authors.
 
-//go:generate -command genxdr go run ../../Godeps/_workspace/src/github.com/calmh/xdr/cmd/genxdr/main.go
+//go:generate -command genxdr go run ../../vendor/github.com/calmh/xdr/cmd/genxdr/main.go
 //go:generate genxdr -o message_xdr.go message.go
 
 package protocol
@@ -11,7 +11,16 @@ import (
 	"fmt"
 )
 
-var sha256OfEmptyBlock = sha256.Sum256(make([]byte, BlockSize))
+var (
+	sha256OfEmptyBlock        = sha256.Sum256(make([]byte, BlockSize))
+	HelloMessageMagic  uint32 = 0x9F79BC40
+)
+
+type HelloMessage struct {
+	DeviceName    string // max:64
+	ClientName    string // max:64
+	ClientVersion string // max:64
+}
 
 type IndexMessage struct {
 	Folder  string     // max:256
@@ -27,7 +36,7 @@ type FileInfo struct {
 	Version      Vector
 	LocalVersion int64
 	CachedSize   int64       // noencode (cache only)
-	Blocks       []BlockInfo // max:1000000
+	Blocks       []BlockInfo // max:10000000
 }
 
 func (f FileInfo) String() string {
@@ -125,11 +134,8 @@ type ResponseMessage struct {
 }
 
 type ClusterConfigMessage struct {
-	DeviceName    string   // max:64
-	ClientName    string   // max:64
-	ClientVersion string   // max:64
-	Folders       []Folder // max:1000000
-	Options       []Option // max:64
+	Folders []Folder // max:1000000
+	Options []Option // max:64
 }
 
 func (o *ClusterConfigMessage) GetOption(key string) string {
@@ -143,6 +149,7 @@ func (o *ClusterConfigMessage) GetOption(key string) string {
 
 type Folder struct {
 	ID      string   // max:256
+	Label   string   // max:256
 	Devices []Device // max:1000000
 	Flags   uint32
 	Options []Option // max:64

@@ -79,7 +79,7 @@ func (m *usageReportingManager) String() string {
 
 // reportData returns the data to be sent in a usage report. It's used in
 // various places, so not part of the usageReportingManager object.
-func reportData(cfg *config.Wrapper, m *model.Model) map[string]interface{} {
+func reportData(cfg configIntf, m modelIntf) map[string]interface{} {
 	res := make(map[string]interface{})
 	res["urVersion"] = usageReportVersion
 	res["uniqueID"] = cfg.Options().URUniqueID
@@ -121,10 +121,14 @@ func reportData(cfg *config.Wrapper, m *model.Model) map[string]interface{} {
 
 	var rescanIntvs []int
 	folderUses := map[string]int{
-		"readonly":      0,
-		"ignorePerms":   0,
-		"ignoreDelete":  0,
-		"autoNormalize": 0,
+		"readonly":            0,
+		"ignorePerms":         0,
+		"ignoreDelete":        0,
+		"autoNormalize":       0,
+		"simpleVersioning":    0,
+		"externalVersioning":  0,
+		"staggeredVersioning": 0,
+		"trashcanVersioning":  0,
 	}
 	for _, cfg := range cfg.Folders() {
 		rescanIntvs = append(rescanIntvs, cfg.RescanIntervalS)
@@ -140,6 +144,9 @@ func reportData(cfg *config.Wrapper, m *model.Model) map[string]interface{} {
 		}
 		if cfg.AutoNormalize {
 			folderUses["autoNormalize"]++
+		}
+		if cfg.Versioning.Type != "" {
+			folderUses[cfg.Versioning.Type+"Versioning"]++
 		}
 	}
 	sort.Ints(rescanIntvs)

@@ -7,7 +7,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -26,14 +25,6 @@ var (
 	c1ID     = NewDeviceID([]byte{2})
 	quickCfg = &quick.Config{}
 )
-
-func TestMain(m *testing.M) {
-	flag.Parse()
-	if flag.Lookup("test.short").Value.String() != "false" {
-		quickCfg.MaxCount = 10
-	}
-	os.Exit(m.Run())
-}
 
 func TestHeaderEncodeDecode(t *testing.T) {
 	f := func(ver, id, typ int) bool {
@@ -198,19 +189,26 @@ func TestClose(t *testing.T) {
 }
 
 func TestElementSizeExceededNested(t *testing.T) {
-	m := ClusterConfigMessage{
+	m := HelloMessage{
 		ClientName: "longstringlongstringlongstringinglongstringlongstringlonlongstringlongstringlon",
 	}
 	_, err := m.MarshalXDR()
 	if err == nil {
-		t.Errorf("ID length %d > max 64, but no error", len(m.Folders[0].ID))
+		t.Errorf("ID length %d > max 64, but no error", len(m.ClientName))
 	}
 }
 
 func TestMarshalIndexMessage(t *testing.T) {
+	if testing.Short() {
+		quickCfg.MaxCount = 10
+	}
+
 	f := func(m1 IndexMessage) bool {
 		if len(m1.Options) == 0 {
 			m1.Options = nil
+		}
+		if len(m1.Files) == 0 {
+			m1.Files = nil
 		}
 		for i, f := range m1.Files {
 			m1.Files[i].CachedSize = 0
@@ -235,9 +233,16 @@ func TestMarshalIndexMessage(t *testing.T) {
 }
 
 func TestMarshalRequestMessage(t *testing.T) {
+	if testing.Short() {
+		quickCfg.MaxCount = 10
+	}
+
 	f := func(m1 RequestMessage) bool {
 		if len(m1.Options) == 0 {
 			m1.Options = nil
+		}
+		if len(m1.Hash) == 0 {
+			m1.Hash = nil
 		}
 		return testMarshal(t, "request", &m1, &RequestMessage{})
 	}
@@ -248,6 +253,10 @@ func TestMarshalRequestMessage(t *testing.T) {
 }
 
 func TestMarshalResponseMessage(t *testing.T) {
+	if testing.Short() {
+		quickCfg.MaxCount = 10
+	}
+
 	f := func(m1 ResponseMessage) bool {
 		if len(m1.Data) == 0 {
 			m1.Data = nil
@@ -261,9 +270,24 @@ func TestMarshalResponseMessage(t *testing.T) {
 }
 
 func TestMarshalClusterConfigMessage(t *testing.T) {
+	if testing.Short() {
+		quickCfg.MaxCount = 10
+	}
+
 	f := func(m1 ClusterConfigMessage) bool {
 		if len(m1.Options) == 0 {
 			m1.Options = nil
+		}
+		if len(m1.Folders) == 0 {
+			m1.Folders = nil
+		}
+		for i := range m1.Folders {
+			if len(m1.Folders[i].Devices) == 0 {
+				m1.Folders[i].Devices = nil
+			}
+			if len(m1.Folders[i].Options) == 0 {
+				m1.Folders[i].Options = nil
+			}
 		}
 		return testMarshal(t, "clusterconfig", &m1, &ClusterConfigMessage{})
 	}
@@ -274,6 +298,10 @@ func TestMarshalClusterConfigMessage(t *testing.T) {
 }
 
 func TestMarshalCloseMessage(t *testing.T) {
+	if testing.Short() {
+		quickCfg.MaxCount = 10
+	}
+
 	f := func(m1 CloseMessage) bool {
 		return testMarshal(t, "close", &m1, &CloseMessage{})
 	}

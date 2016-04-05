@@ -12,11 +12,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/d4l3k/messagediff"
 	"github.com/syncthing/syncthing/lib/protocol"
 )
 
@@ -51,7 +51,7 @@ func TestDefaultValues(t *testing.T) {
 		RestartOnWakeup:         true,
 		AutoUpgradeIntervalH:    12,
 		KeepTemporariesH:        24,
-		CacheIgnoredFiles:       true,
+		CacheIgnoredFiles:       false,
 		ProgressUpdateIntervalS: 5,
 		SymlinksEnabled:         true,
 		LimitBandwidthInLan:     false,
@@ -65,8 +65,8 @@ func TestDefaultValues(t *testing.T) {
 
 	cfg := New(device1)
 
-	if !reflect.DeepEqual(cfg.Options, expected) {
-		t.Errorf("Default config differs;\n  E: %#v\n  A: %#v", expected, cfg.Options)
+	if diff, equal := messagediff.PrettyDiff(expected, cfg.Options); !equal {
+		t.Errorf("Default config differs. Diff:\n%s", diff)
 	}
 }
 
@@ -133,14 +133,14 @@ func TestDeviceConfig(t *testing.T) {
 		if cfg.Version != CurrentVersion {
 			t.Errorf("%d: Incorrect version %d != %d", i, cfg.Version, CurrentVersion)
 		}
-		if !reflect.DeepEqual(cfg.Folders, expectedFolders) {
-			t.Errorf("%d: Incorrect Folders\n  A: %#v\n  E: %#v", i, cfg.Folders, expectedFolders)
+		if diff, equal := messagediff.PrettyDiff(expectedFolders, cfg.Folders); !equal {
+			t.Errorf("%d: Incorrect Folders. Diff:\n%s", i, diff)
 		}
-		if !reflect.DeepEqual(cfg.Devices, expectedDevices) {
-			t.Errorf("%d: Incorrect Devices\n  A: %#v\n  E: %#v", i, cfg.Devices, expectedDevices)
+		if diff, equal := messagediff.PrettyDiff(expectedDevices, cfg.Devices); !equal {
+			t.Errorf("%d: Incorrect Devices. Diff:\n%s", i, diff)
 		}
-		if !reflect.DeepEqual(cfg.Folders[0].DeviceIDs(), expectedDeviceIDs) {
-			t.Errorf("%d: Incorrect DeviceIDs\n  A: %#v\n  E: %#v", i, cfg.Folders[0].DeviceIDs(), expectedDeviceIDs)
+		if diff, equal := messagediff.PrettyDiff(expectedDeviceIDs, cfg.Folders[0].DeviceIDs()); !equal {
+			t.Errorf("%d: Incorrect DeviceIDs. Diff:\n%s", i, diff)
 		}
 	}
 }
@@ -153,8 +153,8 @@ func TestNoListenAddress(t *testing.T) {
 
 	expected := []string{""}
 	actual := cfg.Options().ListenAddress
-	if !reflect.DeepEqual(actual, expected) {
-		t.Errorf("Unexpected ListenAddress %#v", actual)
+	if diff, equal := messagediff.PrettyDiff(expected, actual); !equal {
+		t.Errorf("Unexpected ListenAddress. Diff:\n%s", diff)
 	}
 }
 
@@ -180,7 +180,7 @@ func TestOverriddenValues(t *testing.T) {
 		RestartOnWakeup:         false,
 		AutoUpgradeIntervalH:    24,
 		KeepTemporariesH:        48,
-		CacheIgnoredFiles:       false,
+		CacheIgnoredFiles:       true,
 		ProgressUpdateIntervalS: 10,
 		SymlinksEnabled:         false,
 		LimitBandwidthInLan:     true,
@@ -197,8 +197,8 @@ func TestOverriddenValues(t *testing.T) {
 		t.Error(err)
 	}
 
-	if !reflect.DeepEqual(cfg.Options(), expected) {
-		t.Errorf("Overridden config differs;\n  E: %#v\n  A: %#v", expected, cfg.Options())
+	if diff, equal := messagediff.PrettyDiff(expected, cfg.Options()); !equal {
+		t.Errorf("Overridden config differs. Diff:\n%s", diff)
 	}
 }
 
@@ -231,8 +231,8 @@ func TestDeviceAddressesDynamic(t *testing.T) {
 	}
 
 	actual := cfg.Devices()
-	if !reflect.DeepEqual(actual, expected) {
-		t.Errorf("Devices differ;\n  E: %#v\n  A: %#v", expected, actual)
+	if diff, equal := messagediff.PrettyDiff(expected, actual); !equal {
+		t.Errorf("Devices differ. Diff:\n%s", diff)
 	}
 }
 
@@ -268,8 +268,8 @@ func TestDeviceCompression(t *testing.T) {
 	}
 
 	actual := cfg.Devices()
-	if !reflect.DeepEqual(actual, expected) {
-		t.Errorf("Devices differ;\n  E: %#v\n  A: %#v", expected, actual)
+	if diff, equal := messagediff.PrettyDiff(expected, actual); !equal {
+		t.Errorf("Devices differ. Diff:\n%s", diff)
 	}
 }
 
@@ -302,8 +302,8 @@ func TestDeviceAddressesStatic(t *testing.T) {
 	}
 
 	actual := cfg.Devices()
-	if !reflect.DeepEqual(actual, expected) {
-		t.Errorf("Devices differ;\n  E: %#v\n  A: %#v", expected, actual)
+	if diff, equal := messagediff.PrettyDiff(expected, actual); !equal {
+		t.Errorf("Devices differ. Diff:\n%s", diff)
 	}
 }
 
@@ -325,8 +325,8 @@ func TestVersioningConfig(t *testing.T) {
 		"foo": "bar",
 		"baz": "quux",
 	}
-	if !reflect.DeepEqual(vc.Params, expected) {
-		t.Errorf("vc.Params differ;\n  E: %#v\n  A: %#v", expected, vc.Params)
+	if diff, equal := messagediff.PrettyDiff(expected, vc.Params); !equal {
+		t.Errorf("vc.Params differ. Diff:\n%s", diff)
 	}
 }
 
@@ -447,8 +447,8 @@ func TestNewSaveLoad(t *testing.T) {
 		t.Error(err)
 	}
 
-	if !reflect.DeepEqual(cfg.Raw(), cfg2.Raw()) {
-		t.Errorf("Configs are not equal;\n  E:  %#v\n  A:  %#v", cfg.Raw(), cfg2.Raw())
+	if diff, equal := messagediff.PrettyDiff(cfg.Raw(), cfg2.Raw()); !equal {
+		t.Errorf("Configs are not equal. Diff:\n%s", diff)
 	}
 
 	os.Remove(path)
@@ -497,10 +497,10 @@ func TestCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if bytes.Compare(bsOrig, bsChanged) == 0 {
+	if bytes.Equal(bsOrig, bsChanged) {
 		t.Error("Config should have changed")
 	}
-	if bytes.Compare(bsOrig, bsCopy) != 0 {
+	if !bytes.Equal(bsOrig, bsCopy) {
 		//ioutil.WriteFile("a", bsOrig, 0644)
 		//ioutil.WriteFile("b", bsCopy, 0644)
 		t.Error("Copy should be unchanged")

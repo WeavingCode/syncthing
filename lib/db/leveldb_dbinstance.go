@@ -259,11 +259,11 @@ func (db *Instance) updateFiles(folder, device []byte, fs []protocol.FileInfo, l
 	return maxLocalVer
 }
 
-func (db *Instance) withHave(folder, device []byte, truncate bool, fn Iterator) {
+func (db *Instance) withHave(folder, device, prefix []byte, truncate bool, fn Iterator) {
 	t := db.newReadOnlyTransaction()
 	defer t.close()
 
-	dbi := t.NewIterator(util.BytesPrefix(db.deviceKey(folder, device, nil)[:keyPrefixLen+keyFolderLen+keyDeviceLen]), nil)
+	dbi := t.NewIterator(util.BytesPrefix(db.deviceKey(folder, device, prefix)[:keyPrefixLen+keyFolderLen+keyDeviceLen+len(prefix)]), nil)
 	defer dbi.Release()
 
 	for dbi.Next() {
@@ -454,7 +454,7 @@ nextFile:
 		need := false // If we have a lower version of the file
 		var haveVersion protocol.Vector
 		for _, v := range vl.versions {
-			if bytes.Compare(v.device, device) == 0 {
+			if bytes.Equal(v.device, device) {
 				have = true
 				haveVersion = v.version
 				// XXX: This marks Concurrent (i.e. conflicting) changes as
@@ -550,7 +550,7 @@ func (db *Instance) dropFolder(folder []byte) {
 	dbi := t.NewIterator(util.BytesPrefix([]byte{KeyTypeDevice}), nil)
 	for dbi.Next() {
 		itemFolder := db.deviceKeyFolder(dbi.Key())
-		if bytes.Compare(folder, itemFolder) == 0 {
+		if bytes.Equal(folder, itemFolder) {
 			db.Delete(dbi.Key(), nil)
 		}
 	}
@@ -560,7 +560,7 @@ func (db *Instance) dropFolder(folder []byte) {
 	dbi = t.NewIterator(util.BytesPrefix([]byte{KeyTypeGlobal}), nil)
 	for dbi.Next() {
 		itemFolder := db.globalKeyFolder(dbi.Key())
-		if bytes.Compare(folder, itemFolder) == 0 {
+		if bytes.Equal(folder, itemFolder) {
 			db.Delete(dbi.Key(), nil)
 		}
 	}

@@ -46,6 +46,8 @@ func main() {
 	log.SetOutput(os.Stdout)
 	log.SetFlags(0)
 
+	// If GOPATH isn't set, set it correctly with the assumption that we are
+	// in $GOPATH/src/github.com/syncthing/syncthing.
 	if os.Getenv("GOPATH") == "" {
 		cwd, err := os.Getwd()
 		if err != nil {
@@ -55,6 +57,12 @@ func main() {
 		log.Println("GOPATH is", gopath)
 		os.Setenv("GOPATH", gopath)
 	}
+
+	// We use Go 1.5+ vendoring.
+	os.Setenv("GO15VENDOREXPERIMENT", "1")
+
+	// Set path to $GOPATH/bin:$PATH so that we can for sure find tools we
+	// might have installed during "build.go setup".
 	os.Setenv("PATH", fmt.Sprintf("%s%cbin%c%s", os.Getenv("GOPATH"), os.PathSeparator, os.PathListSeparator, os.Getenv("PATH")))
 
 	flag.StringVar(&goarch, "goarch", runtime.GOARCH, "GOARCH")
@@ -109,13 +117,13 @@ func main() {
 			build(pkg, tags)
 
 		case "test":
-			test("./...")
+			test("./lib/...", "./cmd/...")
 
 		case "bench":
-			bench("./...")
+			bench("./lib/...", "./cmd/...")
 
 		case "assets":
-			assets()
+			rebuildAssets()
 
 		case "xdr":
 			xdr()
@@ -125,9 +133,6 @@ func main() {
 
 		case "transifex":
 			transifex()
-
-		case "deps":
-			deps()
 
 		case "tar":
 			buildTar()
@@ -156,9 +161,9 @@ func main() {
 }
 
 func checkRequiredGoVersion() (float64, bool) {
-	ver := run("go", "version")
-	re := regexp.MustCompile(`go version go(\d+\.\d+)`)
-	if m := re.FindSubmatch(ver); len(m) == 2 {
+	re := regexp.MustCompile(`go(\d+\.\d+)`)
+	ver := runtime.Version()
+	if m := re.FindStringSubmatch(ver); len(m) == 2 {
 		vs := string(m[1])
 		// This is a standard go build. Verify that it's new enough.
 		f, err := strconv.ParseFloat(vs, 64)
@@ -166,7 +171,9 @@ func checkRequiredGoVersion() (float64, bool) {
 			log.Printf("*** Couldn't parse Go version out of %q.\n*** This isn't known to work, proceed on your own risk.", vs)
 			return 0, false
 		}
-		if f < minGoVersion {
+		if f < 1.5 {
+			log.Printf("*** Go version %.01f doesn't support the vendoring mechanism.\n*** Ensure correct dependencies in your $GOPATH.", f)
+		} else if f < minGoVersion {
 			log.Fatalf("*** Go version %.01f is less than required %.01f.\n*** This is known not to work, not proceeding.", f, minGoVersion)
 		}
 		return f, true
@@ -180,23 +187,37 @@ func setup() {
 	runPrint("go", "get", "-v", "golang.org/x/tools/cmd/cover")
 	runPrint("go", "get", "-v", "golang.org/x/tools/cmd/vet")
 	runPrint("go", "get", "-v", "golang.org/x/net/html")
-	runPrint("go", "get", "-v", "github.com/tools/godep")
+	runPrint("go", "get", "-v", "github.com/FiloSottile/gvt")
 	runPrint("go", "get", "-v", "github.com/axw/gocov/gocov")
 	runPrint("go", "get", "-v", "github.com/AlekSi/gocov-xml")
 	runPrint("go", "get", "-v", "bitbucket.org/tebeka/go2xunit")
 }
 
-func test(pkg string) {
-	setBuildEnv()
-	runPrint("go", "test", "-short", "-race", "-timeout", "60s", pkg)
+func test(pkgs ...string) {
+	lazyRebuildAssets()
+
+	useRace := runtime.GOARCH == "amd64"
+	switch runtime.GOOS {
+	case "darwin", "linux", "freebsd", "windows":
+	default:
+		useRace = false
+	}
+
+	if useRace {
+		runPrint("go", append([]string{"test", "-short", "-race", "-timeout", "60s"}, pkgs...)...)
+	} else {
+		runPrint("go", append([]string{"test", "-short", "-timeout", "60s"}, pkgs...)...)
+	}
 }
 
-func bench(pkg string) {
-	setBuildEnv()
-	runPrint("go", "test", "-run", "NONE", "-bench", ".", pkg)
+func bench(pkgs ...string) {
+	lazyRebuildAssets()
+	runPrint("go", append([]string{"test", "-run", "NONE", "-bench", "."}, pkgs...)...)
 }
 
 func install(pkg string, tags []string) {
+	lazyRebuildAssets()
+
 	cwd, err := os.Getwd()
 	if err != nil {
 		log.Fatal(err)
@@ -210,11 +231,15 @@ func install(pkg string, tags []string) {
 		args = append(args, "-race")
 	}
 	args = append(args, pkg)
-	setBuildEnv()
+
+	os.Setenv("GOOS", goos)
+	os.Setenv("GOARCH", goarch)
 	runPrint("go", args...)
 }
 
 func build(pkg string, tags []string) {
+	lazyRebuildAssets()
+
 	binary := "syncthing"
 	if goos == "windows" {
 		binary += ".exe"
@@ -229,7 +254,9 @@ func build(pkg string, tags []string) {
 		args = append(args, "-race")
 	}
 	args = append(args, pkg)
-	setBuildEnv()
+
+	os.Setenv("GOOS", goos)
+	os.Setenv("GOARCH", goarch)
 	runPrint("go", args...)
 }
 
@@ -319,6 +346,7 @@ func buildDeb() {
 		{src: "man/syncthing-security.7", dst: "deb/usr/share/man/man7/syncthing-security.7", perm: 0644},
 		{src: "man/syncthing-versioning.7", dst: "deb/usr/share/man/man7/syncthing-versioning.7", perm: 0644},
 		{src: "etc/linux-systemd/system/syncthing@.service", dst: "deb/lib/systemd/system/syncthing@.service", perm: 0644},
+		{src: "etc/linux-systemd/system/syncthing-resume.service", dst: "deb/lib/systemd/system/syncthing-resume.service", perm: 0644},
 		{src: "etc/linux-systemd/user/syncthing.service", dst: "deb/usr/lib/systemd/user/syncthing.service", perm: 0644},
 	}
 
@@ -391,21 +419,39 @@ func listFiles(dir string) []string {
 	return res
 }
 
-func setBuildEnv() {
-	os.Setenv("GOOS", goos)
-	os.Setenv("GOARCH", goarch)
-	wd, err := os.Getwd()
-	if err != nil {
-		log.Println("Warning: can't determine current dir:", err)
-		log.Println("Build might not work as expected")
-	}
-	os.Setenv("GOPATH", fmt.Sprintf("%s%c%s", filepath.Join(wd, "Godeps", "_workspace"), os.PathListSeparator, os.Getenv("GOPATH")))
-	log.Println("GOPATH=" + os.Getenv("GOPATH"))
+func rebuildAssets() {
+	runPipe("lib/auto/gui.files.go", "go", "run", "script/genassets.go", "gui")
 }
 
-func assets() {
-	setBuildEnv()
-	runPipe("lib/auto/gui.files.go", "go", "run", "script/genassets.go", "gui")
+func lazyRebuildAssets() {
+	if shouldRebuildAssets() {
+		rebuildAssets()
+	}
+}
+
+func shouldRebuildAssets() bool {
+	info, err := os.Stat("lib/auto/gui.files.go")
+	if err != nil {
+		// If the file doesn't exist, we must rebuild it
+		return true
+	}
+
+	// Check if any of the files in gui/ are newer than the asset file. If
+	// so we should rebuild it.
+	currentBuild := info.ModTime()
+	assetsAreNewer := false
+	filepath.Walk("gui", func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if assetsAreNewer {
+			return nil
+		}
+		assetsAreNewer = info.ModTime().After(currentBuild)
+		return nil
+	})
+
+	return assetsAreNewer
 }
 
 func xdr() {
@@ -426,24 +472,17 @@ func translate() {
 func transifex() {
 	os.Chdir("gui/default/assets/lang")
 	runPrint("go", "run", "../../../../script/transifexdl.go")
-	os.Chdir("../../../..")
-	assets()
-}
-
-func deps() {
-	rmr("Godeps")
-	runPrint("godep", "save", "./cmd/...")
 }
 
 func clean() {
-	rmr("bin", "Godeps/_workspace/pkg", "Godeps/_workspace/bin")
+	rmr("bin")
 	rmr(filepath.Join(os.Getenv("GOPATH"), fmt.Sprintf("pkg/%s_%s/github.com/syncthing", goos, goarch)))
 }
 
 func ldflags() string {
-	sep := ' '
-	if goVersion > 1.4 {
-		sep = '='
+	sep := '='
+	if goVersion > 0 && goVersion < 1.5 {
+		sep = ' '
 	}
 
 	b := new(bytes.Buffer)
@@ -495,10 +534,64 @@ func getVersion() string {
 	}
 	// ... then see if we have a Git tag.
 	if ver, err := getGitVersion(); err == nil {
+		if strings.Contains(ver, "-") {
+			// The version already contains a hash and stuff. See if we can
+			// find a current branch name to tack onto it as well.
+			return ver + getBranchSuffix()
+		}
 		return ver
 	}
 	// This seems to be a dev build.
 	return "unknown-dev"
+}
+
+func getBranchSuffix() string {
+	bs, err := runError("git", "branch", "-a", "--contains")
+	if err != nil {
+		return ""
+	}
+
+	branches := strings.Split(string(bs), "\n")
+	if len(branches) == 0 {
+		return ""
+	}
+
+	branch := ""
+	for i, candidate := range branches {
+		if strings.HasPrefix(candidate, "*") {
+			// This is the current branch. Select it!
+			branch = strings.TrimLeft(candidate, " \t*")
+			break
+		} else if i == 0 {
+			// Otherwise the first branch in the list will do.
+			branch = strings.TrimSpace(branch)
+		}
+	}
+
+	if branch == "" {
+		return ""
+	}
+
+	// The branch name may be on the form "remotes/origin/foo" from which we
+	// just want "foo".
+	parts := strings.Split(branch, "/")
+	if len(parts) == 0 || len(parts[len(parts)-1]) == 0 {
+		return ""
+	}
+
+	branch = parts[len(parts)-1]
+	if branch == "master" {
+		// master builds are the default.
+		return ""
+	}
+
+	validBranchRe := regexp.MustCompile(`^[a-zA-Z0-9_.-]+$`)
+	if !validBranchRe.MatchString(branch) {
+		// There's some odd stuff in the branch name. Better skip it.
+		return ""
+	}
+
+	return "-" + branch
 }
 
 func buildStamp() int64 {

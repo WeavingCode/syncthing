@@ -8,6 +8,7 @@ package connections
 
 import (
 	"crypto/tls"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -18,11 +19,12 @@ import (
 	"github.com/juju/ratelimit"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/discover"
-	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/model"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/relay"
 	"github.com/syncthing/syncthing/lib/relay/client"
+	"github.com/syncthing/syncthing/lib/upnp"
+	"github.com/syncthing/syncthing/lib/util"
 
 	"github.com/thejerf/suture"
 )
@@ -37,14 +39,16 @@ var (
 
 type Model interface {
 	protocol.Model
-	AddConnection(conn model.Connection)
+	AddConnection(conn model.Connection, hello protocol.HelloMessage)
 	ConnectedTo(remoteID protocol.DeviceID) bool
 	IsPaused(remoteID protocol.DeviceID) bool
+	OnHello(protocol.DeviceID, net.Addr, protocol.HelloMessage)
+	GetHello(protocol.DeviceID) protocol.HelloMessage
 }
 
-// The connection connectionService listens on TLS and dials configured unconnected
-// devices. Successful connections are handed to the model.
-type connectionService struct {
+// Service listens on TLS and dials configured unconnected devices. Successful
+// connections are handed to the model.
+type Service struct {
 	*suture.Supervisor
 	cfg                  *config.Wrapper
 	myID                 protocol.DeviceID
@@ -52,7 +56,8 @@ type connectionService struct {
 	tlsCfg               *tls.Config
 	discoverer           discover.Finder
 	conns                chan model.IntermediateConnection
-	relayService         *relay.Service
+	upnpService          *upnp.Service
+	relayService         relay.Service
 	bepProtocolName      string
 	tlsDefaultCommonName string
 	lans                 []*net.IPNet
@@ -66,15 +71,16 @@ type connectionService struct {
 	relaysEnabled bool
 }
 
-func NewConnectionService(cfg *config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *tls.Config, discoverer discover.Finder, relayService *relay.Service,
-	bepProtocolName string, tlsDefaultCommonName string, lans []*net.IPNet) suture.Service {
-	service := &connectionService{
-		Supervisor:           suture.NewSimple("connectionService"),
+func NewConnectionService(cfg *config.Wrapper, myID protocol.DeviceID, mdl Model, tlsCfg *tls.Config, discoverer discover.Finder, upnpService *upnp.Service,
+	relayService relay.Service, bepProtocolName string, tlsDefaultCommonName string, lans []*net.IPNet) *Service {
+	service := &Service{
+		Supervisor:           suture.NewSimple("connections.Service"),
 		cfg:                  cfg,
 		myID:                 myID,
 		model:                mdl,
 		tlsCfg:               tlsCfg,
 		discoverer:           discoverer,
+		upnpService:          upnpService,
 		relayService:         relayService,
 		conns:                make(chan model.IntermediateConnection),
 		bepProtocolName:      bepProtocolName,
@@ -87,18 +93,20 @@ func NewConnectionService(cfg *config.Wrapper, myID protocol.DeviceID, mdl Model
 	}
 	cfg.Subscribe(service)
 
+	// The rate variables are in KiB/s in the UI (despite the camel casing
+	// of the name). We multiply by 1024 here to get B/s.
 	if service.cfg.Options().MaxSendKbps > 0 {
-		service.writeRateLimit = ratelimit.NewBucketWithRate(float64(1000*service.cfg.Options().MaxSendKbps), int64(5*1000*service.cfg.Options().MaxSendKbps))
+		service.writeRateLimit = ratelimit.NewBucketWithRate(float64(1024*service.cfg.Options().MaxSendKbps), int64(5*1024*service.cfg.Options().MaxSendKbps))
 	}
 	if service.cfg.Options().MaxRecvKbps > 0 {
-		service.readRateLimit = ratelimit.NewBucketWithRate(float64(1000*service.cfg.Options().MaxRecvKbps), int64(5*1000*service.cfg.Options().MaxRecvKbps))
+		service.readRateLimit = ratelimit.NewBucketWithRate(float64(1024*service.cfg.Options().MaxRecvKbps), int64(5*1024*service.cfg.Options().MaxRecvKbps))
 	}
 
 	// There are several moving parts here; one routine per listening address
 	// to handle incoming connections, one routine to periodically attempt
 	// outgoing connections, one routine to the the common handling
 	// regardless of whether the connection was incoming or outgoing.
-	// Furthermore, a relay connectionService which handles incoming requests to connect
+	// Furthermore, a relay service which handles incoming requests to connect
 	// via the relays.
 	//
 	// TODO: Clean shutdown, and/or handling config changes on the fly. We
@@ -135,17 +143,17 @@ func NewConnectionService(cfg *config.Wrapper, myID protocol.DeviceID, mdl Model
 	return service
 }
 
-func (s *connectionService) handle() {
+func (s *Service) handle() {
 next:
 	for c := range s.conns {
-		cs := c.Conn.ConnectionState()
+		cs := c.ConnectionState()
 
 		// We should have negotiated the next level protocol "bep/1.0" as part
 		// of the TLS handshake. Unfortunately this can't be a hard error,
 		// because there are implementations out there that don't support
 		// protocol negotiation (iOS for one...).
 		if !cs.NegotiatedProtocolIsMutual || cs.NegotiatedProtocol != s.bepProtocolName {
-			l.Infof("Peer %s did not negotiate bep/1.0", c.Conn.RemoteAddr())
+			l.Infof("Peer %s did not negotiate bep/1.0", c.RemoteAddr())
 		}
 
 		// We should have received exactly one certificate from the other
@@ -153,8 +161,8 @@ next:
 		// connection.
 		certs := cs.PeerCertificates
 		if cl := len(certs); cl != 1 {
-			l.Infof("Got peer certificate list of length %d != 1 from %s; protocol error", cl, c.Conn.RemoteAddr())
-			c.Conn.Close()
+			l.Infof("Got peer certificate list of length %d != 1 from %s; protocol error", cl, c.RemoteAddr())
+			c.Close()
 			continue
 		}
 		remoteCert := certs[0]
@@ -165,15 +173,24 @@ next:
 		// clients between the same NAT gateway, and global discovery.
 		if remoteID == s.myID {
 			l.Infof("Connected to myself (%s) - should not happen", remoteID)
-			c.Conn.Close()
+			c.Close()
 			continue
 		}
+
+		hello, err := exchangeHello(c, s.model.GetHello(remoteID))
+		if err != nil {
+			l.Infof("Failed to exchange Hello messages with %s (%s): %s", remoteID, c.RemoteAddr(), err)
+			c.Close()
+			continue next
+		}
+
+		s.model.OnHello(remoteID, c.RemoteAddr(), hello)
 
 		// If we have a relay connection, and the new incoming connection is
 		// not a relay connection, we should drop that, and prefer the this one.
 		s.mut.RLock()
+		skip := false
 		ct, ok := s.connType[remoteID]
-		s.mut.RUnlock()
 		if ok && !ct.IsDirect() && c.Type.IsDirect() {
 			l.Debugln("Switching connections", remoteID)
 			s.model.Close(remoteID, fmt.Errorf("switching connections"))
@@ -185,11 +202,15 @@ next:
 			// in parallel we don't want to do that or we end up with no
 			// connections still established...
 			l.Infof("Connected to already connected device (%s)", remoteID)
-			c.Conn.Close()
-			continue
+			c.Close()
+			skip = true
 		} else if s.model.IsPaused(remoteID) {
 			l.Infof("Connection from paused device (%s)", remoteID)
-			c.Conn.Close()
+			c.Close()
+			skip = true
+		}
+		s.mut.RUnlock()
+		if skip {
 			continue
 		}
 
@@ -207,15 +228,15 @@ next:
 					// Incorrect certificate name is something the user most
 					// likely wants to know about, since it's an advanced
 					// config. Warn instead of Info.
-					l.Warnf("Bad certificate from %s (%v): %v", remoteID, c.Conn.RemoteAddr(), err)
-					c.Conn.Close()
+					l.Warnf("Bad certificate from %s (%v): %v", remoteID, c.RemoteAddr(), err)
+					c.Close()
 					continue next
 				}
 
 				// If rate limiting is set, and based on the address we should
 				// limit the connection, then we wrap it in a limiter.
 
-				limit := s.shouldLimit(c.Conn.RemoteAddr())
+				limit := s.shouldLimit(c.RemoteAddr())
 
 				wr := io.Writer(c.Conn)
 				if limit && s.writeRateLimit != nil {
@@ -227,37 +248,30 @@ next:
 					rd = NewReadLimiter(c.Conn, s.readRateLimit)
 				}
 
-				name := fmt.Sprintf("%s-%s (%s)", c.Conn.LocalAddr(), c.Conn.RemoteAddr(), c.Type)
+				name := fmt.Sprintf("%s-%s (%s)", c.LocalAddr(), c.RemoteAddr(), c.Type)
 				protoConn := protocol.NewConnection(remoteID, rd, wr, s.model, name, deviceCfg.Compression)
 
 				l.Infof("Established secure connection to %s at %s", remoteID, name)
-				l.Debugf("cipher suite: %04X in lan: %t", c.Conn.ConnectionState().CipherSuite, !limit)
+				l.Debugf("cipher suite: %04X in lan: %t", c.ConnectionState().CipherSuite, !limit)
 
+				s.mut.Lock()
 				s.model.AddConnection(model.Connection{
-					c.Conn,
+					c,
 					protoConn,
 					c.Type,
-				})
-				s.mut.Lock()
+				}, hello)
 				s.connType[remoteID] = c.Type
 				s.mut.Unlock()
 				continue next
 			}
 		}
 
-		if !s.cfg.IgnoredDevice(remoteID) {
-			events.Default.Log(events.DeviceRejected, map[string]string{
-				"device":  remoteID.String(),
-				"address": c.Conn.RemoteAddr().String(),
-			})
-		}
-
-		l.Infof("Connection from %s (%s) with ignored device ID %s", c.Conn.RemoteAddr(), c.Type, remoteID)
-		c.Conn.Close()
+		l.Infof("Connection from %s (%s) with ignored device ID %s", c.RemoteAddr(), c.Type, remoteID)
+		c.Close()
 	}
 }
 
-func (s *connectionService) connect() {
+func (s *Service) connect() {
 	delay := time.Second
 	for {
 		l.Debugln("Reconnect loop")
@@ -269,16 +283,16 @@ func (s *connectionService) connect() {
 
 			l.Debugln("Reconnect loop for", deviceID)
 
-			if s.model.IsPaused(deviceID) {
-				continue
-			}
-
-			connected := s.model.ConnectedTo(deviceID)
-
 			s.mut.RLock()
+			paused := s.model.IsPaused(deviceID)
+			connected := s.model.ConnectedTo(deviceID)
 			ct, ok := s.connType[deviceID]
 			relaysEnabled := s.relaysEnabled
 			s.mut.RUnlock()
+
+			if paused {
+				continue
+			}
 			if connected && ok && ct.IsDirect() {
 				l.Debugln("Already connected to", deviceID, "via", ct.String())
 				continue
@@ -340,7 +354,7 @@ func (s *connectionService) connect() {
 	}
 }
 
-func (s *connectionService) resolveAddresses(deviceID protocol.DeviceID, inAddrs []string) (addrs []string, relays []discover.Relay) {
+func (s *Service) resolveAddresses(deviceID protocol.DeviceID, inAddrs []string) (addrs []string, relays []discover.Relay) {
 	for _, addr := range inAddrs {
 		if addr == "dynamic" {
 			if s.discoverer != nil {
@@ -356,7 +370,7 @@ func (s *connectionService) resolveAddresses(deviceID protocol.DeviceID, inAddrs
 	return
 }
 
-func (s *connectionService) connectDirect(deviceID protocol.DeviceID, addr string) *tls.Conn {
+func (s *Service) connectDirect(deviceID protocol.DeviceID, addr string) *tls.Conn {
 	uri, err := url.Parse(addr)
 	if err != nil {
 		l.Infoln("Failed to parse connection url:", addr, err)
@@ -379,7 +393,7 @@ func (s *connectionService) connectDirect(deviceID protocol.DeviceID, addr strin
 	return conn
 }
 
-func (s *connectionService) connectViaRelay(deviceID protocol.DeviceID, addr discover.Relay) *tls.Conn {
+func (s *Service) connectViaRelay(deviceID protocol.DeviceID, addr discover.Relay) *tls.Conn {
 	uri, err := url.Parse(addr.URL)
 	if err != nil {
 		l.Infoln("Failed to parse relay connection url:", addr, err)
@@ -418,7 +432,7 @@ func (s *connectionService) connectViaRelay(deviceID protocol.DeviceID, addr dis
 	return tc
 }
 
-func (s *connectionService) acceptRelayConns() {
+func (s *Service) acceptRelayConns() {
 	for {
 		conn := s.relayService.Accept()
 		s.conns <- model.IntermediateConnection{
@@ -428,7 +442,7 @@ func (s *connectionService) acceptRelayConns() {
 	}
 }
 
-func (s *connectionService) shouldLimit(addr net.Addr) bool {
+func (s *Service) shouldLimit(addr net.Addr) bool {
 	if s.cfg.Options().LimitBandwidthInLan {
 		return true
 	}
@@ -445,11 +459,11 @@ func (s *connectionService) shouldLimit(addr net.Addr) bool {
 	return !tcpaddr.IP.IsLoopback()
 }
 
-func (s *connectionService) VerifyConfiguration(from, to config.Configuration) error {
+func (s *Service) VerifyConfiguration(from, to config.Configuration) error {
 	return nil
 }
 
-func (s *connectionService) CommitConfiguration(from, to config.Configuration) bool {
+func (s *Service) CommitConfiguration(from, to config.Configuration) bool {
 	s.mut.Lock()
 	s.relaysEnabled = to.Options.RelaysEnabled
 	s.mut.Unlock()
@@ -468,6 +482,146 @@ func (s *connectionService) CommitConfiguration(from, to config.Configuration) b
 	}
 
 	return true
+}
+
+// ExternalAddresses returns a list of addresses that are our best guess for
+// where we are reachable from the outside. As a special case, we may return
+// one or more addresses with an empty IP address (0.0.0.0 or ::) and just
+// port number - this means that the outside address of a NAT gateway should
+// be substituted.
+func (s *Service) ExternalAddresses() []string {
+	return s.addresses(false)
+}
+
+// AllAddresses returns a list of addresses that are our best guess for where
+// we are reachable from the local network. Same conditions as
+// ExternalAddresses, but private IPv4 addresses are included.
+func (s *Service) AllAddresses() []string {
+	return s.addresses(true)
+}
+
+func (s *Service) addresses(includePrivateIPV4 bool) []string {
+	var addrs []string
+
+	// Grab our listen addresses from the config. Unspecified ones are passed
+	// on verbatim (to be interpreted by a global discovery server or local
+	// discovery peer). Public addresses are passed on verbatim. Private
+	// addresses are filtered.
+	for _, addrStr := range s.cfg.Options().ListenAddress {
+		addrURL, err := url.Parse(addrStr)
+		if err != nil {
+			l.Infoln("Listen address", addrStr, "is invalid:", err)
+			continue
+		}
+		addr, err := net.ResolveTCPAddr(addrURL.Scheme, addrURL.Host)
+		if err != nil {
+			l.Infoln("Listen address", addrStr, "is invalid:", err)
+			continue
+		}
+
+		if addr.IP == nil || addr.IP.IsUnspecified() {
+			// Address like 0.0.0.0:22000 or [::]:22000 or :22000; include as is.
+			addrs = append(addrs, util.Address(addrURL.Scheme, addr.String()))
+		} else if isPublicIPv4(addr.IP) || isPublicIPv6(addr.IP) {
+			// A public address; include as is.
+			addrs = append(addrs, util.Address(addrURL.Scheme, addr.String()))
+		} else if includePrivateIPV4 && addr.IP.To4().IsGlobalUnicast() {
+			// A private IPv4 address.
+			addrs = append(addrs, util.Address(addrURL.Scheme, addr.String()))
+		}
+	}
+
+	// Get an external port mapping from the upnpService, if it has one. If so,
+	// add it as another unspecified address.
+	if s.upnpService != nil {
+		if port := s.upnpService.ExternalPort(); port != 0 {
+			addrs = append(addrs, fmt.Sprintf("tcp://:%d", port))
+		}
+	}
+
+	return addrs
+}
+
+func isPublicIPv4(ip net.IP) bool {
+	ip = ip.To4()
+	if ip == nil {
+		// Not an IPv4 address (IPv6)
+		return false
+	}
+
+	// IsGlobalUnicast below only checks that it's not link local or
+	// multicast, and we want to exclude private (NAT:ed) addresses as well.
+	rfc1918 := []net.IPNet{
+		{IP: net.IP{10, 0, 0, 0}, Mask: net.IPMask{255, 0, 0, 0}},
+		{IP: net.IP{172, 16, 0, 0}, Mask: net.IPMask{255, 240, 0, 0}},
+		{IP: net.IP{192, 168, 0, 0}, Mask: net.IPMask{255, 255, 0, 0}},
+	}
+	for _, n := range rfc1918 {
+		if n.Contains(ip) {
+			return false
+		}
+	}
+
+	return ip.IsGlobalUnicast()
+}
+
+func isPublicIPv6(ip net.IP) bool {
+	if ip.To4() != nil {
+		// Not an IPv6 address (IPv4)
+		// (To16() returns a v6 mapped v4 address so can't be used to check
+		// that it's an actual v6 address)
+		return false
+	}
+
+	return ip.IsGlobalUnicast()
+}
+
+func exchangeHello(c net.Conn, h protocol.HelloMessage) (protocol.HelloMessage, error) {
+	if err := c.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		return protocol.HelloMessage{}, err
+	}
+	defer c.SetDeadline(time.Time{})
+
+	header := make([]byte, 8)
+	msg := h.MustMarshalXDR()
+
+	binary.BigEndian.PutUint32(header[:4], protocol.HelloMessageMagic)
+	binary.BigEndian.PutUint32(header[4:], uint32(len(msg)))
+
+	if _, err := c.Write(header); err != nil {
+		return protocol.HelloMessage{}, err
+	}
+
+	if _, err := c.Write(msg); err != nil {
+		return protocol.HelloMessage{}, err
+	}
+
+	if _, err := io.ReadFull(c, header); err != nil {
+		return protocol.HelloMessage{}, err
+	}
+
+	if binary.BigEndian.Uint32(header[:4]) != protocol.HelloMessageMagic {
+		return protocol.HelloMessage{}, fmt.Errorf("incorrect magic")
+	}
+
+	msgSize := binary.BigEndian.Uint32(header[4:])
+	if msgSize > 1024 {
+		return protocol.HelloMessage{}, fmt.Errorf("hello message too big")
+	}
+
+	buf := make([]byte, msgSize)
+
+	var hello protocol.HelloMessage
+
+	if _, err := io.ReadFull(c, buf); err != nil {
+		return protocol.HelloMessage{}, err
+	}
+
+	if err := hello.UnmarshalXDR(buf); err != nil {
+		return protocol.HelloMessage{}, err
+	}
+
+	return hello, nil
 }
 
 // serviceFunc wraps a function to create a suture.Service without stop

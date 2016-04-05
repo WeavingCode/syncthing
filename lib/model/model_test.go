@@ -15,10 +15,12 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/d4l3k/messagediff"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/db"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -95,7 +97,7 @@ func TestRequest(t *testing.T) {
 	if err != nil {
 		t.Error(err)
 	}
-	if bytes.Compare(bs, []byte("foobar")) != 0 {
+	if !bytes.Equal(bs, []byte("foobar")) {
 		t.Errorf("Incorrect data from request: %q", string(bs))
 	}
 
@@ -277,7 +279,7 @@ func BenchmarkRequest(b *testing.B) {
 		&net.TCPConn{},
 		fc,
 		ConnectionTypeDirectAccept,
-	})
+	}, protocol.HelloMessage{})
 	m.Index(device1, "default", files, 0, nil)
 
 	b.ResetTimer()
@@ -293,11 +295,10 @@ func BenchmarkRequest(b *testing.B) {
 }
 
 func TestDeviceRename(t *testing.T) {
-	ccm := protocol.ClusterConfigMessage{
+	hello := protocol.HelloMessage{
 		ClientName:    "syncthing",
 		ClientVersion: "v0.9.4",
 	}
-
 	defer os.Remove("tmpconfig.xml")
 
 	rawCfg := config.New(device1)
@@ -311,35 +312,39 @@ func TestDeviceRename(t *testing.T) {
 	db := db.OpenMemory()
 	m := NewModel(cfg, protocol.LocalDeviceID, "device", "syncthing", "dev", db, nil)
 
-	fc := FakeConnection{
-		id:          device1,
-		requestData: []byte("some data to return"),
+	if cfg.Devices()[device1].Name != "" {
+		t.Errorf("Device already has a name")
 	}
 
-	m.AddConnection(Connection{
+	conn := Connection{
 		&net.TCPConn{},
-		fc,
+		FakeConnection{
+			id:          device1,
+			requestData: []byte("some data to return"),
+		},
 		ConnectionTypeDirectAccept,
-	})
+	}
+
+	m.AddConnection(conn, hello)
 
 	m.ServeBackground()
+
 	if cfg.Devices()[device1].Name != "" {
 		t.Errorf("Device already has a name")
 	}
 
-	m.ClusterConfig(device1, ccm)
-	if cfg.Devices()[device1].Name != "" {
-		t.Errorf("Device already has a name")
-	}
+	m.Close(device1, protocol.ErrTimeout)
+	hello.DeviceName = "tester"
+	m.AddConnection(conn, hello)
 
-	ccm.DeviceName = "tester"
-	m.ClusterConfig(device1, ccm)
 	if cfg.Devices()[device1].Name != "tester" {
 		t.Errorf("Device did not get a name")
 	}
 
-	ccm.DeviceName = "tester2"
-	m.ClusterConfig(device1, ccm)
+	m.Close(device1, protocol.ErrTimeout)
+	hello.DeviceName = "tester2"
+	m.AddConnection(conn, hello)
+
 	if cfg.Devices()[device1].Name != "tester" {
 		t.Errorf("Device name got overwritten")
 	}
@@ -402,13 +407,13 @@ func TestClusterConfig(t *testing.T) {
 	if l := len(r.Devices); l != 2 {
 		t.Errorf("Incorrect number of devices %d != 2", l)
 	}
-	if id := r.Devices[0].ID; bytes.Compare(id, device1[:]) != 0 {
+	if id := r.Devices[0].ID; !bytes.Equal(id, device1[:]) {
 		t.Errorf("Incorrect device ID %x != %x", id, device1)
 	}
 	if r.Devices[0].Flags&protocol.FlagIntroducer == 0 {
 		t.Error("Device1 should be flagged as Introducer")
 	}
-	if id := r.Devices[1].ID; bytes.Compare(id, device2[:]) != 0 {
+	if id := r.Devices[1].ID; !bytes.Equal(id, device2[:]) {
 		t.Errorf("Incorrect device ID %x != %x", id, device2)
 	}
 	if r.Devices[1].Flags&protocol.FlagIntroducer != 0 {
@@ -422,13 +427,13 @@ func TestClusterConfig(t *testing.T) {
 	if l := len(r.Devices); l != 2 {
 		t.Errorf("Incorrect number of devices %d != 2", l)
 	}
-	if id := r.Devices[0].ID; bytes.Compare(id, device1[:]) != 0 {
+	if id := r.Devices[0].ID; !bytes.Equal(id, device1[:]) {
 		t.Errorf("Incorrect device ID %x != %x", id, device1)
 	}
 	if r.Devices[0].Flags&protocol.FlagIntroducer == 0 {
 		t.Error("Device1 should be flagged as Introducer")
 	}
-	if id := r.Devices[1].ID; bytes.Compare(id, device2[:]) != 0 {
+	if id := r.Devices[1].ID; !bytes.Equal(id, device2[:]) {
 		t.Errorf("Incorrect device ID %x != %x", id, device2)
 	}
 	if r.Devices[1].Flags&protocol.FlagIntroducer != 0 {
@@ -1208,5 +1213,91 @@ func TestIgnoreDelete(t *testing.T) {
 	}
 	if f.IsDeleted() {
 		t.Fatal("foo should not be marked for deletion")
+	}
+}
+
+func TestUnifySubs(t *testing.T) {
+	cases := []struct {
+		in     []string // input to unifySubs
+		exists []string // paths that exist in the database
+		out    []string // expected output
+	}{
+		{
+			// trailing slashes are cleaned, known paths are just passed on
+			[]string{"foo/", "bar//"},
+			[]string{"foo", "bar"},
+			[]string{"bar", "foo"}, // the output is sorted
+		},
+		{
+			// "foo/bar" gets trimmed as it's covered by foo
+			[]string{"foo", "bar/", "foo/bar/"},
+			[]string{"foo", "bar"},
+			[]string{"bar", "foo"},
+		},
+		{
+			// "bar" gets trimmed to "" as it's unknown,
+			// "" gets simplified to the empty list
+			[]string{"foo", "bar", "foo/bar"},
+			[]string{"foo"},
+			nil,
+		},
+		{
+			// two independent known paths, both are kept
+			// "usr/lib" is not a prefix of "usr/libexec"
+			[]string{"usr/lib", "usr/libexec"},
+			[]string{"usr/lib", "usr/libexec"},
+			[]string{"usr/lib", "usr/libexec"},
+		},
+		{
+			// "usr/lib" is a prefix of "usr/lib/exec"
+			[]string{"usr/lib", "usr/lib/exec"},
+			[]string{"usr/lib", "usr/libexec"},
+			[]string{"usr/lib"},
+		},
+		{
+			// .stignore and .stfolder are special and are passed on
+			// verbatim even though they are unknown
+			[]string{".stfolder", ".stignore"},
+			[]string{},
+			[]string{".stfolder", ".stignore"},
+		},
+		{
+			// but the presense of something else unknown forces an actual
+			// scan
+			[]string{".stfolder", ".stignore", "foo/bar"},
+			[]string{},
+			nil,
+		},
+	}
+
+	if runtime.GOOS == "windows" {
+		// Fixup path separators
+		for i := range cases {
+			for j, p := range cases[i].in {
+				cases[i].in[j] = filepath.FromSlash(p)
+			}
+			for j, p := range cases[i].exists {
+				cases[i].exists[j] = filepath.FromSlash(p)
+			}
+			for j, p := range cases[i].out {
+				cases[i].out[j] = filepath.FromSlash(p)
+			}
+		}
+	}
+
+	for i, tc := range cases {
+		exists := func(f string) bool {
+			for _, e := range tc.exists {
+				if f == e {
+					return true
+				}
+			}
+			return false
+		}
+
+		out := unifySubs(tc.in, exists)
+		if diff, equal := messagediff.PrettyDiff(tc.out, out); !equal {
+			t.Errorf("Case %d failed; got %v, expected %v, diff:\n%s", i, out, tc.out, diff)
+		}
 	}
 }
